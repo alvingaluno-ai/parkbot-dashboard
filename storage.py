@@ -74,14 +74,19 @@ class EventStore:
                     (since_epoch,),
                 ).fetchall()
 
-        totals = {"IN": 0, "OUT": 0}
+       totals = {"IN": 0, "OUT": 0}
+        # Vehicle-type breakdown counts arrivals only (event == "IN"). A car
+        # that enters and later exits is one vehicle, not two — counting
+        # both IN and OUT here would double the total for every completed
+        # visit, which is misleading for "how many cars came in today."
         by_type = {"motorcycle": 0, "car": 0, "large": 0}
         for r in rows:
             ev = r["event"]
             vt = r["vehicle_type"]
             if ev in totals:
                 totals[ev] += 1
-            by_type[vt] = by_type.get(vt, 0) + 1
+            if ev == "IN":
+                by_type[vt] = by_type.get(vt, 0) + 1
 
         return {
             "in": totals["IN"],
