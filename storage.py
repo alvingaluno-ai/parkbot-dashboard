@@ -74,7 +74,7 @@ class EventStore:
                     (since_epoch,),
                 ).fetchall()
 
-       totals = {"IN": 0, "OUT": 0}
+        totals = {"IN": 0, "OUT": 0}
         # Vehicle-type breakdown counts arrivals only (event == "IN"). A car
         # that enters and later exits is one vehicle, not two — counting
         # both IN and OUT here would double the total for every completed
