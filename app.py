@@ -16,7 +16,10 @@ comparison and the mismatch vs. the original doc's simpler two-boolean-sensor
 design.
 """
 
+import json
 import os
+import queue
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -32,12 +35,43 @@ store = EventStore(os.environ.get("DB_PATH", "parkbot.db"))
 # in production — the fallback here is only for local bench testing.
 DEVICE_API_KEY = os.environ.get("DEVICE_API_KEY", "REPLACE_WITH_PER_DEVICE_API_KEY")
 
-# A device is considered "online" if we've received an event from it more
-# recently than this. The current firmware only POSTs when a vehicle
-# actually crosses, not on a fixed heartbeat interval, so "online" here
-# really means "recently active" — see README.md, section on the heartbeat
-# gap, before treating this as a strict up/down signal.
-ONLINE_WINDOW_SECONDS = int(os.environ.get("ONLINE_WINDOW_SECONDS", "600"))
+# A device is "online" if it's sent an event OR a heartbeat more recently
+# than this. The firmware heartbeats every HEARTBEAT_INTERVAL_MS (30s by
+# default) independent of vehicle traffic, so a quiet-but-alive device still
+# shows online — this window just needs to survive a couple of missed
+# heartbeats, not a long traffic lull.
+ONLINE_WINDOW_SECONDS = int(os.environ.get("ONLINE_WINDOW_SECONDS", "90"))
+
+# Heartbeats are kept in memory only (not written to SQLite) — they're a
+# "still alive" signal, not history worth persisting. Resets on restart/
+# redeploy are fine: the device re-establishes it within one heartbeat
+# interval. device_id -> last-heartbeat unix seconds.
+_heartbeats = {}
+_heartbeats_lock = threading.Lock()
+
+# In-process pub/sub so the dashboard can be pushed updates instead of
+# polling on a timer. Each connected browser tab gets its own Queue; any
+# ingested event or heartbeat drops a tiny "something changed" message into
+# every queue, and the browser refetches /api/status + /api/logs the moment
+# it receives one. Works because Render's free tier + this Procfile run a
+# single worker process, so all queues live in the same memory space — this
+# would need a real pub/sub (e.g. Redis) if the service ever scales to
+# multiple worker processes.
+_subscribers = set()
+_subscribers_lock = threading.Lock()
+
+
+def broadcast(kind):
+    msg = json.dumps({"type": kind, "t": time.time()})
+    with _subscribers_lock:
+        dead = []
+        for q in _subscribers:
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _subscribers.discard(q)
 
 # Philippines = UTC+8, matching GMT_OFFSET_SEC in the firmware. Used only to
 # compute "today's" totals on a local-midnight boundary.
@@ -86,7 +120,24 @@ def api_ingest_event():
             pass
 
     row_id = store.record_event(device_id, event, vehicle_type, ts_epoch, uptime_ms)
+    broadcast("event")
     return jsonify({"ok": True, "id": row_id}), 201
+
+
+@app.route("/api/v1/heartbeat", methods=["POST"])
+def api_heartbeat():
+    if not require_device_key(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True, force=True) or {}
+    device_id = body.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id required"}), 400
+
+    with _heartbeats_lock:
+        _heartbeats[device_id] = time.time()
+    broadcast("heartbeat")
+    return jsonify({"ok": True}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +149,14 @@ def api_status():
     all_time_totals = store.counts_since(None)
 
     devices = []
-    for device_id in store.known_devices() or ["gate-01-treadle"]:
-        seen = store.last_seen(device_id)
+    with _heartbeats_lock:
+        heartbeat_devices = set(_heartbeats.keys())
+    for device_id in (set(store.known_devices()) | heartbeat_devices) or {"gate-01-treadle"}:
+        event_seen = store.last_seen(device_id)
+        with _heartbeats_lock:
+            heartbeat_seen = _heartbeats.get(device_id)
+        candidates = [t for t in (event_seen, heartbeat_seen) if t is not None]
+        seen = max(candidates) if candidates else None
         online = seen is not None and (time.time() - seen) < ONLINE_WINDOW_SECONDS
         devices.append({
             "device_id": device_id,
@@ -120,6 +177,40 @@ def api_status():
 def api_logs():
     limit = min(int(request.args.get("limit", 50)), 200)
     return jsonify({"events": store.recent_events(limit)})
+
+
+@app.route("/api/stream", methods=["GET"])
+def api_stream():
+    """Server-Sent Events stream. Each message just means 'something changed
+    — go refetch /api/status and /api/logs.' Keeping the payload tiny and
+    reusing the existing REST endpoints avoids having two different code
+    paths compute the same numbers."""
+    q = queue.Queue(maxsize=20)
+    with _subscribers_lock:
+        _subscribers.add(q)
+
+    def gen():
+        try:
+            yield "data: {\"type\": \"connected\"}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=15)
+                    yield f"data: {msg}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"  # prevents idle proxies from closing the connection
+        finally:
+            with _subscribers_lock:
+                _subscribers.discard(q)
+
+    return Response(
+        gen(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.route("/health", methods=["GET"])
@@ -322,7 +413,7 @@ PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="panel">
-      <h2>Today by vehicle type</h2>
+      <h2>In today, by vehicle type</h2>
       <div class="bar-row">
         <span class="name">Motorcycle</span>
         <div class="bar-track"><div class="bar-fill motorcycle" id="barMoto" style="width:0%"></div></div>
@@ -341,7 +432,7 @@ PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <footer>Refreshes every 3s · today resets at local midnight (UTC+8)</footer>
+  <footer>Live · updates instantly on each crossing · today resets at local midnight (UTC+8)</footer>
 </div>
 
 <script>
@@ -434,7 +525,21 @@ async function pollLogs(){
 
 function tick(){ pollStatus(); pollLogs(); }
 tick();
-setInterval(tick, 3000);
+
+// Instant updates: the backend pushes a tiny "something changed" message
+// over this connection the moment an event or heartbeat comes in, and we
+// just refetch the normal REST endpoints. EventSource reconnects on its
+// own if the connection drops (e.g. Render free tier waking from idle).
+function connectStream(){
+  const es = new EventSource('/api/stream');
+  es.onmessage = () => tick();
+}
+connectStream();
+
+// Safety net only — covers the rare case where the SSE connection silently
+// stalls without firing an error. Everyday updates come from the stream
+// above, not this timer.
+setInterval(tick, 15000);
 </script>
 </body>
 </html>"""
